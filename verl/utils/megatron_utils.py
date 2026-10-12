@@ -1040,6 +1040,15 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
 
 
 def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
+    """Configure loss scaling and gradient/parameter synchronization for model chunks.
+
+    Use Megatron-Bridge's gradient finalizer when shared expert adapters need
+    expert-parallel synchronization, and install overlap callbacks as configured.
+
+    Raises:
+        RuntimeError: Shared expert adapters require expert-parallel gradient
+            synchronization but the installed Bridge lacks the required helpers.
+    """
     from megatron.core.distributed import finalize_model_grads
     from megatron.core.utils import get_model_config
 
@@ -1060,8 +1069,30 @@ def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
 
         if enable_expert_parallel_grad_sync_in_finalize(model) > 0:
             finalize_fn = finalize_model_grads_with_expert_adapter_sync
-    except ImportError:
-        pass
+    except ImportError as exc:
+        # Bridge 0.6.2 only synchronizes autograd's gradient, which can be a
+        # dummy tensor when MCore accumulates directly into main_grad. Refuse
+        # shared expert adapters until Bridge can finalize their real grads.
+        for model_chunk in model:
+            for module in model_chunk.modules():
+                if (
+                    getattr(module, "is_expert", False)
+                    and ".local_experts." not in getattr(module, "base_linear_name", "")
+                    and hasattr(module, "linear_in")
+                    and hasattr(module, "linear_out")
+                    and getattr(getattr(module, "config", None), "expert_model_parallel_size", 1) > 1
+                    and any(
+                        weight is not None and weight.requires_grad and weight.ndim == 2
+                        for linear in (module.linear_in, module.linear_out)
+                        for weight in [getattr(linear, "weight", None)]
+                    )
+                ):
+                    raise RuntimeError(
+                        "Shared expert adapters with expert parallelism require Megatron-Bridge's "
+                        "enable_expert_parallel_grad_sync_in_finalize and "
+                        "finalize_model_grads_with_expert_adapter_sync helpers to synchronize main_grad. "
+                        "The installed Bridge version does not provide them."
+                    ) from exc
 
     for one_model in model:
         config = get_model_config(one_model)
